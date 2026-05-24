@@ -111,36 +111,6 @@ INT16 Patched[] = {
     -1, -1, -1, -1, -1, -1, -1, -1
 };
 
-// ===================== 去黄字补丁（从参考代码原样加入）=====================
-INT16 Original_warning[] = {
-    -1, 0x06, 0x80, 0x52,
-    -1, 0x00, 0x00, -1,
-    -1, 0x05, -1,-1
-};
-INT16 Patched_warning = 0x7F;
-
-INT32 patch_warning(CHAR8* buffer, INT32 size, INT32* offset) {
-    INT32 pattern_len = sizeof(Original_warning) / sizeof(INT16);
-    INT32 patched_count = 0;
-    if (size < pattern_len) return 0;
-    for (INT32 i = 0; i <= size - pattern_len; ++i) {
-        BOOLEAN match = TRUE;
-        for (INT32 j = 0; j < pattern_len; ++j) {
-            if (Original_warning[j] != -1 && (UINT8)buffer[i + j] != (UINT8)Original_warning[j]) {
-                match = FALSE; break;
-            }
-        }
-        if (match) {
-            i -= 4;
-            *offset = i;
-            buffer[i] = Patched_warning;
-            return 1;
-        }
-    }
-    return patched_count;
-}
-// ===========================================================================
-
 INT32 patch_abl_bootstate(CHAR8* buffer, INT32 size,
                           INT8* lock_register_num, INT32* offset) {
     INT32 pattern_len = sizeof(Original) / sizeof(INT16);
@@ -332,12 +302,38 @@ static INT32 track_forward_patch_strb(CHAR8* buffer, INT32 size, INT32 ldrb_off,
     Print_patcher("Forward tracking: no sink STRB found after anchor 0x%X\n", anchor_off);
     return -1;
 }
-
+//
+INT32 source_callback(CHAR8* buffer, INT32 size, INT32 now_offset, INT8 current_target, INT32 anchor_offset) {
+    Print_patcher("  Before: %02X %02X %02X %02X\n",
+        (UINT8)buffer[now_offset], (UINT8)buffer[now_offset+1],
+        (UINT8)buffer[now_offset+2], (UINT8)buffer[now_offset+3]);
+    #ifndef DISABLE_PATCH_4
+    write_instr(buffer, now_offset, encode_movz_w((UINT8)current_target, 1));
+    Print_patcher("  After : %02X %02X %02X %02X (MOV W%d, #1)\n",
+        (UINT8)buffer[now_offset], (UINT8)buffer[now_offset+1],
+        (UINT8)buffer[now_offset+2], (UINT8)buffer[now_offset+3],
+        (int)current_target);
+    #endif
+    #ifndef DISABLE_PATCH_5
+    INT32 fwd = track_forward_patch_strb(buffer, size, now_offset, current_target, anchor_offset);
+    if (fwd <= 0) {
+        Print_patcher("Warning: sink STRB not found after anchor 0x%X\n", anchor_offset);
+        return -1;
+    }
+    Print_patcher("Sink patched successfully.\n");
+    #endif
+    return 0;
+}
+INT32 empty_callback(CHAR8* buffer, INT32 size, INT32 now_offset, INT8 current_target, INT32 anchor_offset) {
+    return 0;
+}
+//定义 callback 函数类型
+typedef INT32 (*SourceCallback)(CHAR8* buffer, INT32 size, INT32 now_offset, INT8 current_target, INT32 anchor_offset);
 /* ============================================================
  *  第十二部分：反向找 LDRB 源头
  * ============================================================ */
 INT32 find_ldrB_instructio_reverse(CHAR8* buffer, INT32 size,
-                                   INT32 anchor_offset, INT8 target_register) {
+                                   INT32 anchor_offset, INT8 target_register,INT32* global_var_offset, SourceCallback callback) {
     INT32 now_offset = anchor_offset - 4;
     INT8 current_target = target_register;
     INT32 bounce_count = 0;
@@ -407,26 +403,8 @@ INT32 find_ldrB_instructio_reverse(CHAR8* buffer, INT32 size,
         if (d.type == INST_LDRB_IMM && (INT8)d.rt == current_target && d.rn != 31) {
             Print_patcher("Found source LDRB at 0x%X: LDRB W%d,[X%d,#0x%X](%d bounces)\n",
                    now_offset, d.rt, d.rn, d.imm, bounce_count);
-            Print_patcher("  Before: %02X %02X %02X %02X\n",
-                   (UINT8)buffer[now_offset], (UINT8)buffer[now_offset+1],
-                   (UINT8)buffer[now_offset+2], (UINT8)buffer[now_offset+3]);
-            #ifndef DISABLE_PATCH_4
-            write_instr(buffer, now_offset, encode_movz_w((UINT8)current_target, 1));
-            Print_patcher("  After : %02X %02X %02X %02X (MOV W%d, #1)\n",
-                   (UINT8)buffer[now_offset], (UINT8)buffer[now_offset+1],
-                   (UINT8)buffer[now_offset+2], (UINT8)buffer[now_offset+3],
-                   (int)current_target);
-            #endif
-            #ifndef DISABLE_PATCH_5
-            INT32 fwd = track_forward_patch_strb(buffer, size, now_offset,
-                                                  current_target, anchor_offset);
-            if (fwd <= 0) {
-                Print_patcher("Warning: sink STRB not found after anchor 0x%X\n", anchor_offset);
-                return -1;
-            }
-            Print_patcher("Sink patched successfully.\n");
-            #endif
-            return 0;
+            *global_var_offset = (INT32)d.imm;
+            return callback(buffer, size, now_offset, current_target, anchor_offset);
         }
 
         now_offset -= 4;
@@ -559,20 +537,71 @@ BOOLEAN patch_string_jump(CHAR8* buffer, INT32 size) {
     return patched;
 }
 
+INT32 find_warning_offset(CHAR8* buffer, INT32 size, UINT64 load_base) {
+    if (size < 24) return 0;
+    INT32 patched = 0;
+
+    for (INT32 i = 0; i <= size - 24; i += 4) {
+        DecodedInst a0 = decode_at(buffer, i);
+        DecodedInst a1 = decode_at(buffer, i + 4);
+        DecodedInst b0 = decode_at(buffer, i + 8);
+        DecodedInst b1 = decode_at(buffer, i + 12);
+
+        if (a0.type != INST_ADRP || a1.type != INST_ADD_X_IMM) continue;
+        if (a1.rt != a0.rt || a1.rn != a0.rt) continue;
+
+        if (b0.type != INST_ADRP || b1.type != INST_ADD_X_IMM) continue;
+        if (b1.rt != b0.rt || b1.rn != b0.rt) continue;
+
+
+        UINT8 xa = a0.rt, xb = b0.rt;
+        if (xa == xb) continue;
+
+        INT64 off0 = calc_adrl_file_offset(buffer, i,      load_base);
+        INT64 off1 = calc_adrl_file_offset(buffer, i + 8,  load_base);
+
+        if (!str_at(buffer, size, off0, "Orange State\n")) continue;
+        if (!str_at(buffer, size, off1, "Your device has been unlocked and can't be trusted\n"))   continue;
+        return i;
+    }
+    return -1;
+}
+
+BOOLEAN patch_warning(CHAR8* buffer, INT32 size, INT32 global_var_offset) {
+    INT32 warn_off = find_warning_offset(buffer, size, 0);
+    if (warn_off < 0) {
+        Print_patcher("Warning not found\n");
+        return FALSE;
+    }
+    Print_patcher("Warning message ADRL offset: 0x%X\n", warn_off);
+    //逆向找到CBZ
+    INT32 max_search_range = warn_off - 64 > 0 ? warn_off - 64 : 0;//限制搜索范围，避免误伤其他CBZ
+    for(INT32 i = warn_off - 4; i >= max_search_range; i -= 4) {
+        DecodedInst d = decode_at(buffer, i);
+        if (d.type == INST_PACIASP) {
+            Print_patcher("Reached function start at 0x%X, stop\n", i);
+            return FALSE;
+        }
+        if (d.type == INST_CBZ_W) {
+            Print_patcher("Register W%d is used for warning jump at 0x%X\n", d.rt, i);
+            //track back
+            INT32 offset = -1;
+            find_ldrB_instructio_reverse(buffer, size, i, (INT8)d.rt, &offset, empty_callback);
+            if (offset < 0 || offset != global_var_offset) continue; // not from lock state var, skip
+            Print_patcher("Warning jump source var: 0x%X Matched\n", offset);
+            write_instr(buffer,i,change_rt(&d, 31)); // change to CBZ WZR
+            Print_patcher("Patched CBZ at 0x%X to use WZR, warning disabled\n", i);
+            break;
+        }
+    }
+    return TRUE;
+}
+
 BOOLEAN PatchBuffer(CHAR8* data, INT32 size) {
     #ifndef DISABLE_PATCH_1
     if (patch_abl_gbl(data, size) != 0)
         Print_patcher("Warning: Failed to patch ABL GBL\n");
     #endif
-
-    // ===================== 启用去黄字补丁 =====================
-    INT32 warn_off = -1;
-    if (patch_warning(data, size, &warn_off)) {
-        Print_patcher("patch_warning offset : 0x%X\n", warn_off);
-    } else {
-        Print_patcher("Warning: patch_warning failed\n");
-    }
-    // ==========================================================
 
     #ifndef DISABLE_PATCH_2
     INT32 patched_adrl = patch_adrl_unlocked_to_locked(data, size, 0);
@@ -602,9 +631,18 @@ BOOLEAN PatchBuffer(CHAR8* data, INT32 size) {
     Print_patcher("Lock register : W%d\n", (int)lock_register_num);
     Print_patcher("Boot patches: %d\n", num_patches);
 
-    if (find_ldrB_instructio_reverse(data, size, offset, lock_register_num) != 0) {
+    INT32 global_var_offset = -1;
+    if (find_ldrB_instructio_reverse(data, size, offset, lock_register_num, &global_var_offset, source_callback) != 0) {
         Print_patcher("Warning: Failed to patch LDRB->STRB chain for W%d\n",
                (int)lock_register_num);
     }
+    Print_patcher("Global variable offset (for warning patch): 0x%X\n", global_var_offset);
+    // ===================== 启用去黄字补丁 =====================
+    INT32 warn_off = -1;
+    if (!patch_warning(data, size, global_var_offset)) {
+        Print_patcher("Warning: patch_warning failed\n");
+    }
+    // ==========================================================
+
     return 1;
 }
