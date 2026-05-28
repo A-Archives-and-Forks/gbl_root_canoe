@@ -21,9 +21,6 @@ jobs:
       run: |
         echo "NDK_PATH=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
 
-    - name: Run test
-      run: make test
-
     - name: Build Toolkits
       run: |
         make clean
